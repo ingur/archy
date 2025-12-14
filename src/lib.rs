@@ -106,17 +106,17 @@ impl<F, T, E> ServiceResultExt<T, E> for F where F: Future<Output = Result<Resul
 /// Schedule determines when a system runs during the app lifecycle
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Schedule {
-    /// Runs before service workers spawn, blocks until complete (DB migrations, config validation)
+    /// Runs before service workers spawn, blocks until complete
     First,
-    /// Runs after service workers spawn, blocks until complete (cache warming via Client<S>)
+    /// Runs after service workers spawn, blocks until complete
     Startup,
-    /// Spawns as background task, runs until shutdown (event loops, long-running workers)
+    /// Spawns as background task, runs until shutdown
     Run,
-    /// Spawns as background task, runs repeatedly on interval (metrics, health checks)
+    /// Spawns as background task, runs repeatedly on interval
     Fixed(Duration),
-    /// Runs when shutdown triggered, blocks until complete (flush buffers, save state)
+    /// Runs when shutdown triggered, blocks until complete
     Shutdown,
-    /// Runs after everything stopped, blocks until complete (final cleanup)
+    /// Runs after everything stopped, blocks until complete
     Last,
 }
 
