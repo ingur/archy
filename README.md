@@ -69,6 +69,18 @@ Systems are async functions that run at specific lifecycle phases:
 - `Schedule::Shutdown` - Cleanup when shutting down
 - `Schedule::Last` - Final cleanup after everything stops
 
+```rust
+use std::time::Duration;
+
+async fn run_migrations() { /* ... */ }
+async fn warmup_cache(db: Client<Database>) { /* ... */ }
+async fn health_check() { println!("OK"); }
+
+app.add_system(Schedule::First, run_migrations);
+app.add_system(Schedule::Startup, warmup_cache);
+app.add_system(Schedule::Fixed(Duration::from_secs(30)), health_check);
+```
+
 ### Resources
 
 Shared state injected into services and systems:
