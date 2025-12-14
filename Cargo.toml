@@ -1,0 +1,20 @@
+[package]
+name = "archy"
+version = "0.1.0"
+edition = "2024"
+description = "An async application framework with services, systems, and dependency injection"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ingur/archy"
+readme = "README.md"
+keywords = ["async", "framework", "actor", "tokio", "service"]
+categories = ["asynchronous", "concurrency"]
+rust-version = "1.85"
+
+[dependencies]
+archy-macros = { path = "archy-macros", version = "0.1.0" }
+tokio = { version = "1", features = ["full"] }
+tokio-util = "0.7"
+parking_lot = "0.12"
+async-channel = "2"
+tracing = "0.1.43"
+thiserror = "2"
