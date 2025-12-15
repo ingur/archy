@@ -14,7 +14,7 @@ An async application framework for Rust with services, systems, and dependency i
 
 ```toml
 [dependencies]
-archy = "0.1"
+archy = "0.2"
 tokio = { version = "1", features = ["full"] }
 ```
 
