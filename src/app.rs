@@ -194,7 +194,7 @@ where
                 match result {
                     Ok(()) => break,
                     Err(e) if e.is_panic() => {
-                        eprintln!("[archy] {} panicked, restarting: {:?}", name, e);
+                        tracing::warn!(target: "archy", task = %name, error = ?e, "task panicked, restarting");
                     }
                     Err(_) => break,
                 }
@@ -215,10 +215,10 @@ where
                         }
                         attempts += 1;
                         if attempts >= max {
-                            eprintln!("[archy] {}: max restart attempts ({}) reached", name, max);
+                            tracing::error!(target: "archy", task = %name, max_attempts = max, "max restart attempts reached");
                             break;
                         }
-                        eprintln!("[archy] {} panicked, restarting ({}/{}): {:?}", name, attempts, max, e);
+                        tracing::warn!(target: "archy", task = %name, attempt = attempts, max_attempts = max, error = ?e, "task panicked, restarting");
                     }
                     Err(_) => break,
                 }
@@ -521,7 +521,7 @@ impl App {
             let abort_handles: Vec<_> = service_handles.iter().map(|h| h.abort_handle()).collect();
             let drain = async { for h in service_handles { let _ = h.await; } };
             if tokio::time::timeout(timeout, drain).await.is_err() {
-                eprintln!("[archy] shutdown timeout, force-aborting workers");
+                tracing::warn!(target: "archy", "shutdown timeout, force-aborting workers");
                 for h in abort_handles { h.abort(); }
             }
         } else {

@@ -199,8 +199,7 @@ impl<E: Clone> Sub<E> {
             match self.receiver.recv().await {
                 Ok(event) => return Some(event),
                 Err(broadcast::error::RecvError::Lagged(n)) => {
-                    #[cfg(debug_assertions)]
-                    eprintln!("[archy] event subscriber lagged, skipped {} events", n);
+                    tracing::debug!(target: "archy", skipped = n, "event subscriber lagged");
                     continue;
                 }
                 Err(broadcast::error::RecvError::Closed) => return None,
