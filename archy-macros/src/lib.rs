@@ -84,7 +84,7 @@ pub fn service(_attr: TokenStream, item: TokenStream) -> TokenStream {
     };
 
     let msg_enum_name = format_ident!("{}Msg", service_name);
-    let client_trait_name = format_ident!("{}Client", service_name);
+    let methods_struct_name = format_ident!("{}Methods", service_name);
 
     // Collect public async methods
     let mut methods = Vec::new();
@@ -183,35 +183,8 @@ pub fn service(_attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     });
 
-    // Generate client trait methods (using async fn for cleaner syntax)
-    let client_trait_methods = methods.iter().map(|method| {
-        let method_name = &method.sig.ident;
-
-        // Get parameters with types (skip &self)
-        let params: Vec<_> = method.sig.inputs.iter().skip(1).filter_map(|arg| {
-            if let FnArg::Typed(pat_type) = arg {
-                if let Pat::Ident(pat_ident) = &*pat_type.pat {
-                    let name = &pat_ident.ident;
-                    let ty = &pat_type.ty;
-                    return Some(quote! { #name: #ty });
-                }
-            }
-            None
-        }).collect();
-
-        // Get return type wrapped in Result
-        let return_type = match &method.sig.output {
-            ReturnType::Default => quote! { () },
-            ReturnType::Type(_, ty) => quote! { #ty },
-        };
-
-        quote! {
-            async fn #method_name(&self, #(#params),*) -> ::std::result::Result<#return_type, ::archy::ServiceError>;
-        }
-    });
-
-    // Generate client trait impl methods
-    let client_impl_methods = methods.iter().map(|method| {
+    // Generate client inherent methods (no trait needed!)
+    let client_inherent_methods = methods.iter().map(|method| {
         let method_name = &method.sig.ident;
         let variant_name = to_pascal_case(&method_name.to_string());
         let variant_ident = format_ident!("{}", variant_name);
@@ -246,7 +219,7 @@ pub fn service(_attr: TokenStream, item: TokenStream) -> TokenStream {
             };
 
             quote! {
-                async fn #method_name(&self, #(#param_decls),*) -> ::std::result::Result<#return_type, ::archy::ServiceError> {
+                pub async fn #method_name(&self, #(#param_decls),*) -> ::std::result::Result<#return_type, ::archy::ServiceError> {
                     self.sender.send(#msg_construction).await
                         .map_err(|_| ::archy::ServiceError::ChannelClosed)?;
                     Ok(())
@@ -260,7 +233,7 @@ pub fn service(_attr: TokenStream, item: TokenStream) -> TokenStream {
             };
 
             quote! {
-                async fn #method_name(&self, #(#param_decls),*) -> ::std::result::Result<#return_type, ::archy::ServiceError> {
+                pub async fn #method_name(&self, #(#param_decls),*) -> ::std::result::Result<#return_type, ::archy::ServiceError> {
                     let (tx, rx) = ::archy::tokio::sync::oneshot::channel();
                     self.sender.send(#msg_construction).await
                         .map_err(|_| ::archy::ServiceError::ChannelClosed)?;
@@ -279,9 +252,28 @@ pub fn service(_attr: TokenStream, item: TokenStream) -> TokenStream {
             #(#msg_variants),*
         }
 
+        // Generated client methods struct
+        #[derive(Clone)]
+        pub struct #methods_struct_name {
+            sender: ::archy::async_channel::Sender<#msg_enum_name>,
+        }
+
+        // Implement ClientMethods trait for dependency injection
+        impl ::archy::ClientMethods<#service_name> for #methods_struct_name {
+            fn from_sender(sender: ::archy::async_channel::Sender<#msg_enum_name>) -> Self {
+                Self { sender }
+            }
+        }
+
+        // Inherent methods
+        impl #methods_struct_name {
+            #(#client_inherent_methods)*
+        }
+
         // Generated Service implementation
         impl ::archy::Service for #service_name {
             type Message = #msg_enum_name;
+            type ClientMethods = #methods_struct_name;
 
             fn create(app: &::archy::App) -> Self {
                 <Self as ::archy::ServiceFactory>::create(app)
@@ -294,17 +286,6 @@ pub fn service(_attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 }
             }
-        }
-
-        // Generated client trait
-        #[allow(async_fn_in_trait)]
-        pub trait #client_trait_name {
-            #(#client_trait_methods)*
-        }
-
-        // Generated client impl
-        impl #client_trait_name for ::archy::Client<#service_name> {
-            #(#client_impl_methods)*
         }
     };
 

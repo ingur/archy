@@ -24,6 +24,7 @@ pub use app::{
 
 // Re-export for macro-generated code
 pub use tokio;
+pub use async_channel;
 pub use archy_macros::{Service, service};
 
 // --- Prelude ---
@@ -31,7 +32,7 @@ pub use archy_macros::{Service, service};
 pub mod prelude {
     pub use crate::{
         App, Res, Client, Emit, Sub, Shutdown,
-        Service, ServiceFactory, ServiceFutureExt, ServiceResultExt, FromApp, Module,
+        Service, ServiceFactory, ClientMethods, ServiceFutureExt, ServiceResultExt, FromApp, Module,
         Schedule, RestartPolicy, ServiceError,
         service,
     };
@@ -162,11 +163,20 @@ impl<T> std::ops::Deref for Res<T> {
 }
 
 pub struct Client<S: Service> {
-    pub sender: Sender<S::Message>,
+    methods: S::ClientMethods,
 }
 
 impl<S: Service> Clone for Client<S> {
-    fn clone(&self) -> Self { Client { sender: self.sender.clone() } }
+    fn clone(&self) -> Self {
+        Client { methods: self.methods.clone() }
+    }
+}
+
+impl<S: Service> std::ops::Deref for Client<S> {
+    type Target = S::ClientMethods;
+    fn deref(&self) -> &Self::Target {
+        &self.methods
+    }
 }
 
 /// Event emitter - fire-and-forget broadcast to all subscribers.
@@ -231,8 +241,14 @@ impl Shutdown {
 
 // --- Traits ---
 
+/// Trait for generated client methods structs
+pub trait ClientMethods<S: Service>: Clone + Send + Sync + 'static {
+    fn from_sender(sender: Sender<S::Message>) -> Self;
+}
+
 pub trait Service: Sized + Send + Sync + 'static {
     type Message: Send + 'static;
+    type ClientMethods: ClientMethods<Self>;
 
     fn create(app: &App) -> Self;
     fn handle(self: Arc<Self>, msg: Self::Message) -> impl Future<Output = ()> + Send;
@@ -269,7 +285,9 @@ impl<S: Service> FromApp for Client<S> {
             .unwrap_or_else(|| panic!("Service {} not registered", std::any::type_name::<S>()));
         let sender_ref = (**sender).downcast_ref::<Sender<S::Message>>()
             .expect("Service sender type mismatch");
-        Client { sender: sender_ref.clone() }
+        Client {
+            methods: S::ClientMethods::from_sender(sender_ref.clone())
+        }
     }
 }
 
