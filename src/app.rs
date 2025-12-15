@@ -49,7 +49,13 @@ pub struct SystemDescriptor {
     pub id: TypeId,
     pub schedule: Schedule,
     pub spawner: SystemSpawner,
-    pub config: SystemConfig,
+    pub(crate) overrides: SystemOverrides,
+}
+
+impl SystemDescriptor {
+    pub(crate) fn new(id: TypeId, schedule: Schedule, spawner: SystemSpawner) -> Self {
+        Self { id, schedule, spawner, overrides: SystemOverrides::default() }
+    }
 }
 
 // --- IntoSystem Trait ---
@@ -102,6 +108,27 @@ impl Default for WorkerConfig {
     }
 }
 
+// --- Overrides ---
+
+#[derive(Clone, Default)]
+struct ServiceOverrides {
+    workers: Option<usize>,
+    capacity: Option<usize>,
+    concurrent: Option<usize>,
+    restart: Option<RestartPolicy>,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct SystemOverrides {
+    workers: Option<usize>,
+    restart: Option<RestartPolicy>,
+}
+
+#[derive(Clone, Default)]
+struct EventOverrides {
+    capacity: Option<usize>,
+}
+
 #[derive(Clone)]
 pub(crate) struct EventConfig {
     pub(crate) capacity: usize,
@@ -124,62 +151,60 @@ pub trait AddEvents {
 // --- Config Builders ---
 
 pub struct ServiceConfigBuilder<'a> {
-    pub(crate) app: &'a mut App,
-    pub(crate) id: TypeId,
+    overrides: &'a mut ServiceOverrides,
 }
 
 impl ServiceConfigBuilder<'_> {
     pub fn workers(self, n: usize) -> Self {
-        self.app.service_configs.get_mut(&self.id).unwrap().workers = n;
+        self.overrides.workers = Some(n);
         self
     }
+
     pub fn capacity(self, n: usize) -> Self {
-        self.app.service_configs.get_mut(&self.id).unwrap().capacity = n;
+        self.overrides.capacity = Some(n);
         self
     }
-    /// Allow up to `n` concurrent message handlers per worker (default: sequential).
-    pub fn concurrent(self, max_per_worker: usize) -> Self {
-        self.app.service_configs.get_mut(&self.id).unwrap().concurrent = Some(max_per_worker);
+
+    // Note: Setting concurrent to 0 is equivalent to `.sequential()`
+    pub fn concurrent(self, n: usize) -> Self {
+        self.overrides.concurrent = Some(n);
         self
     }
+
+    pub fn sequential(self) -> Self {
+        self.overrides.concurrent = Some(0);
+        self
+    }
+
     pub fn restart(self, policy: RestartPolicy) -> Self {
-        self.app.service_configs.get_mut(&self.id).unwrap().restart = policy;
+        self.overrides.restart = Some(policy);
         self
     }
 }
 
 pub struct SystemConfigBuilder<'a> {
-    pub(crate) app: &'a mut App,
-    pub(crate) id: TypeId,
+    overrides: &'a mut SystemOverrides,
 }
 
 impl SystemConfigBuilder<'_> {
-    fn get_config_mut(&mut self) -> &mut SystemConfig {
-        &mut self.app.systems.iter_mut()
-            .find(|d| d.id == self.id)
-            .expect("System not found")
-            .config
-    }
-
-    pub fn workers(mut self, n: usize) -> Self {
-        self.get_config_mut().workers = n;
+    pub fn workers(self, n: usize) -> Self {
+        self.overrides.workers = Some(n);
         self
     }
 
-    pub fn restart(mut self, policy: RestartPolicy) -> Self {
-        self.get_config_mut().restart = policy;
+    pub fn restart(self, policy: RestartPolicy) -> Self {
+        self.overrides.restart = Some(policy);
         self
     }
 }
 
 pub struct EventConfigBuilder<'a> {
-    pub(crate) app: &'a mut App,
-    pub(crate) id: TypeId,
+    overrides: &'a mut EventOverrides,
 }
 
 impl EventConfigBuilder<'_> {
     pub fn capacity(self, n: usize) -> Self {
-        self.app.event_configs.get_mut(&self.id).unwrap().capacity = n;
+        self.overrides.capacity = Some(n);
         self
     }
 }
@@ -260,13 +285,16 @@ pub struct App {
 
     pub(crate) systems: Vec<SystemDescriptor>,
 
-    pub(crate) service_configs: HashMap<TypeId, WorkerConfig>,
-    pub(crate) event_configs: HashMap<TypeId, EventConfig>,
+    service_overrides: HashMap<TypeId, ServiceOverrides>,
+    event_overrides: HashMap<TypeId, EventOverrides>,
+
+    service_defaults: ServiceOverrides,
+    system_defaults: SystemOverrides,
+    event_defaults: EventOverrides,
 
     closers: Arc<Mutex<Vec<Closer>>>,
     pub(crate) shutdown_token: CancellationToken,
     pub(crate) shutdown_timeout: Option<Duration>,
-    default_capacity: usize,
 }
 
 impl App {
@@ -282,18 +310,35 @@ impl App {
             channel_creators: HashMap::new(),
             service_spawners: HashMap::new(),
             systems: Vec::new(),
-            service_configs: HashMap::new(),
-            event_configs: HashMap::new(),
+            service_overrides: HashMap::new(),
+            event_overrides: HashMap::new(),
+            service_defaults: ServiceOverrides::default(),
+            system_defaults: SystemOverrides::default(),
+            event_defaults: EventOverrides::default(),
             closers: Arc::new(Mutex::new(Vec::new())),
             shutdown_token: CancellationToken::new(),
             shutdown_timeout: None,
-            default_capacity: Self::DEFAULT_EVENT_CAPACITY,
         }
     }
 
     /// Configure shutdown behavior
     pub fn shutdown(&mut self) -> ShutdownConfigBuilder<'_> {
         ShutdownConfigBuilder { app: self }
+    }
+
+    /// Configure default settings for all services
+    pub fn service_defaults(&mut self) -> ServiceConfigBuilder<'_> {
+        ServiceConfigBuilder { overrides: &mut self.service_defaults }
+    }
+
+    /// Configure default settings for all systems
+    pub fn system_defaults(&mut self) -> SystemConfigBuilder<'_> {
+        SystemConfigBuilder { overrides: &mut self.system_defaults }
+    }
+
+    /// Configure default settings for all events
+    pub fn event_defaults(&mut self) -> EventConfigBuilder<'_> {
+        EventConfigBuilder { overrides: &mut self.event_defaults }
     }
 
     /// Extract a dependency from the App (convenience helper for Service::create)
@@ -318,15 +363,14 @@ impl App {
         self
     }
 
-    pub fn add_event<E: Clone + Send + 'static>(&mut self) -> &mut Self {
+    pub fn add_event<E: Clone + Send + 'static>(&mut self) -> EventConfigBuilder<'_> {
         let id = TypeId::of::<E>();
         assert!(!self.event_creators.contains_key(&id), "Event {} already registered", std::any::type_name::<E>());
-        self.event_configs.insert(id, EventConfig { capacity: self.default_capacity });
         self.event_creators.insert(id, Box::new(|capacity| {
             let (tx, _) = broadcast::channel::<E>(capacity);
             Arc::new(EventBus { sender: tx })
         }));
-        self
+        EventConfigBuilder { overrides: self.event_overrides.entry(id).or_default() }
     }
 
     pub fn add_events<T: AddEvents>(&mut self) -> &mut Self {
@@ -336,15 +380,13 @@ impl App {
 
     pub fn event<E: Clone + Send + 'static>(&mut self) -> EventConfigBuilder<'_> {
         let id = TypeId::of::<E>();
-        assert!(self.event_configs.contains_key(&id), "Event {} not registered", std::any::type_name::<E>());
-        EventConfigBuilder { app: self, id }
+        assert!(self.event_creators.contains_key(&id), "Event {} not registered", std::any::type_name::<E>());
+        EventConfigBuilder { overrides: self.event_overrides.entry(id).or_default() }
     }
 
     pub fn add_service<S: Service>(&mut self) -> ServiceConfigBuilder<'_> {
         let id = TypeId::of::<S>();
-        assert!(!self.service_configs.contains_key(&id), "Service {} already registered", std::any::type_name::<S>());
-
-        self.service_configs.insert(id, WorkerConfig::default());
+        assert!(!self.channel_creators.contains_key(&id), "Service {} already registered", std::any::type_name::<S>());
 
         let closers = self.closers.clone();
         self.channel_creators.insert(id, Box::new(move |capacity| {
@@ -364,7 +406,6 @@ impl App {
                 let restart = config.restart;
 
                 match config.concurrent {
-                    // Sequential mode (default): process one message at a time per worker
                     None => Box::pin(async move {
                         supervise("service worker", restart, || {
                             let rx = rx.clone();
@@ -377,7 +418,6 @@ impl App {
                         }).await;
                     }) as BoxFuture,
 
-                    // Concurrent mode: up to N concurrent handlers per worker
                     Some(max_concurrent) => {
                         let semaphore = Arc::new(Semaphore::new(max_concurrent));
                         Box::pin(async move {
@@ -403,7 +443,7 @@ impl App {
             }).collect()
         }));
 
-        ServiceConfigBuilder { app: self, id }
+        ServiceConfigBuilder { overrides: self.service_overrides.entry(id).or_default() }
     }
 
     pub fn add_services<T: AddServices>(&mut self) -> &mut Self {
@@ -413,22 +453,21 @@ impl App {
 
     pub fn service<S: Service>(&mut self) -> ServiceConfigBuilder<'_> {
         let id = TypeId::of::<S>();
-        assert!(self.service_configs.contains_key(&id), "Service {} not registered", std::any::type_name::<S>());
-        ServiceConfigBuilder { app: self, id }
+        assert!(self.channel_creators.contains_key(&id), "Service {} not registered", std::any::type_name::<S>());
+        ServiceConfigBuilder { overrides: self.service_overrides.entry(id).or_default() }
     }
 
     /// Add a single system with the given schedule
-    pub fn add_system<F, Args>(&mut self, schedule: Schedule, system: F) -> &mut Self
+    pub fn add_system<F, Args>(&mut self, schedule: Schedule, system: F) -> SystemConfigBuilder<'_>
     where
         F: IntoSystem<Args>,
     {
-        self.systems.push(SystemDescriptor {
-            id: TypeId::of::<F>(),
+        self.systems.push(SystemDescriptor::new(
+            TypeId::of::<F>(),
             schedule,
-            spawner: system.into_system(),
-            config: SystemConfig::default(),
-        });
-        self
+            system.into_system(),
+        ));
+        SystemConfigBuilder { overrides: &mut self.systems.last_mut().unwrap().overrides }
     }
 
     /// Add multiple systems with the given schedule: `add_systems(Schedule::Run, (sys1, sys2, sys3))`
@@ -445,7 +484,51 @@ impl App {
     where
         F: IntoSystem<Args>,
     {
-        SystemConfigBuilder { app: self, id: TypeId::of::<F>() }
+        let id = TypeId::of::<F>();
+        let desc = self.systems.iter_mut()
+            .find(|d| d.id == id)
+            .expect("System not found");
+        SystemConfigBuilder { overrides: &mut desc.overrides }
+    }
+
+    fn resolve_service(&self, id: TypeId) -> WorkerConfig {
+        let o = self.service_overrides.get(&id);
+        let d = &self.service_defaults;
+        WorkerConfig {
+            workers: o.and_then(|x| x.workers)
+                .or(d.workers)
+                .unwrap_or(WorkerConfig::DEFAULT_WORKERS),
+            capacity: o.and_then(|x| x.capacity)
+                .or(d.capacity)
+                .unwrap_or(WorkerConfig::DEFAULT_CAPACITY),
+            // concurrent(0) forces sequential mode (filters to None)
+            concurrent: o.and_then(|x| x.concurrent).or(d.concurrent).filter(|&n| n > 0),
+            restart: o.and_then(|x| x.restart)
+                .or(d.restart)
+                .unwrap_or_default(),
+        }
+    }
+
+    fn resolve_system(&self, overrides: &SystemOverrides) -> SystemConfig {
+        let d = &self.system_defaults;
+        SystemConfig {
+            workers: overrides.workers
+                .or(d.workers)
+                .unwrap_or(SystemConfig::DEFAULT_WORKERS),
+            restart: overrides.restart
+                .or(d.restart)
+                .unwrap_or_default(),
+        }
+    }
+
+    fn resolve_event(&self, id: TypeId) -> EventConfig {
+        let o = self.event_overrides.get(&id);
+        let d = &self.event_defaults;
+        EventConfig {
+            capacity: o.and_then(|x| x.capacity)
+                .or(d.capacity)
+                .unwrap_or(Self::DEFAULT_EVENT_CAPACITY),
+        }
     }
 
     /// Run the application until shutdown
@@ -456,15 +539,15 @@ impl App {
         // Phase 0: Create event buses
         let event_creators = std::mem::take(&mut self.event_creators);
         for (id, creator) in event_creators {
-            let capacity = self.event_configs.get(&id).map(|c| c.capacity).unwrap_or(self.default_capacity);
-            self.event_buses.insert(id, creator(capacity));
+            let config = self.resolve_event(id);
+            self.event_buses.insert(id, creator(config.capacity));
         }
 
         // Phase 1: Create service channels
         let creators = std::mem::take(&mut self.channel_creators);
         let mut receivers: HashMap<TypeId, Arc<dyn Any + Send + Sync>> = HashMap::new();
         for (id, creator) in creators {
-            let config = self.service_configs.get(&id).cloned().unwrap_or_default();
+            let config = self.resolve_service(id);
             let (tx, rx) = creator(config.capacity);
             self.service_senders.insert(id, tx);
             receivers.insert(id, rx);
@@ -477,7 +560,7 @@ impl App {
         // Phase 3: Spawn service workers
         let spawners = std::mem::take(&mut self.service_spawners);
         for (id, spawner) in spawners {
-            let config = self.service_configs.get(&id).cloned().unwrap_or_default();
+            let config = self.resolve_service(id);
             let rx = receivers.remove(&id).unwrap();
             for fut in spawner(&self, rx, config) {
                 service_handles.push(tokio::spawn(fut));
@@ -491,8 +574,9 @@ impl App {
         // Phase 5: Spawn Run systems (background)
         let run = self.extract_systems(|s| matches!(s, Schedule::Run));
         for desc in run {
-            for factory in (desc.spawner)(&self, desc.config.workers) {
-                system_handles.push(tokio::spawn(Self::supervise_system(factory, desc.config.restart)));
+            let config = self.resolve_system(&desc.overrides);
+            for factory in (desc.spawner)(&self, config.workers) {
+                system_handles.push(tokio::spawn(Self::supervise_system(factory, config.restart)));
             }
         }
 
@@ -503,13 +587,14 @@ impl App {
                 Schedule::Fixed(d) => d,
                 _ => unreachable!(),
             };
+            let config = self.resolve_system(&desc.overrides);
             let token = self.shutdown_token.clone();
-            let restart = desc.config.restart;
-            for factory in (desc.spawner)(&self, desc.config.workers) {
+            for factory in (desc.spawner)(&self, config.workers) {
                 let token = token.clone();
+                let restart = config.restart;
                 system_handles.push(tokio::spawn(async move {
                     supervise("fixed system", restart, || {
-                        let factory = factory.clone(); // Arc clone - warm path only
+                        let factory = factory.clone();
                         let token = token.clone();
                         async move {
                             let mut interval = tokio::time::interval(duration);
@@ -574,8 +659,9 @@ impl App {
     async fn run_phase_blocking(&self, systems: Vec<SystemDescriptor>) {
         let mut handles = Vec::new();
         for desc in systems {
-            for factory in (desc.spawner)(self, desc.config.workers) {
-                handles.push(tokio::spawn(Self::supervise_system(factory, desc.config.restart)));
+            let config = self.resolve_system(&desc.overrides);
+            for factory in (desc.spawner)(self, config.workers) {
+                handles.push(tokio::spawn(Self::supervise_system(factory, config.restart)));
             }
         }
         for h in handles { let _ = h.await; }

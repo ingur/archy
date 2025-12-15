@@ -17,7 +17,7 @@ pub use app::{
     // Config builders
     ServiceConfigBuilder, SystemConfigBuilder, EventConfigBuilder, ShutdownConfigBuilder,
     // System traits (needed for add_system to work)
-    IntoSystem, IntoSystemConfigs, SystemConfig, SystemDescriptor, SystemFactory,
+    IntoSystem, IntoSystemConfigs, SystemDescriptor, SystemFactory,
     // Batch traits
     AddResources, AddServices, AddEvents,
 };

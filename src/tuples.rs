@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use crate::app::{
     AddEvents, AddResources, AddServices, App, BoxFuture, IntoSystem, IntoSystemConfigs,
-    SystemConfig, SystemDescriptor, SystemFactory, SystemSpawner,
+    SystemDescriptor, SystemFactory, SystemSpawner,
 };
 use crate::{FromApp, Schedule, Service};
 
@@ -109,12 +109,7 @@ macro_rules! impl_into_system_configs_tuple {
             fn into_descriptors(self, schedule: Schedule) -> Vec<SystemDescriptor> {
                 let ($($T,)+) = self;
                 vec![
-                    $(SystemDescriptor {
-                        id: TypeId::of::<$T>(),
-                        schedule,
-                        spawner: $T.into_system(),
-                        config: SystemConfig::default(),
-                    }),+
+                    $(SystemDescriptor::new(TypeId::of::<$T>(), schedule, $T.into_system())),+
                 ]
             }
         }
