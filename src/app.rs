@@ -224,7 +224,7 @@ impl ShutdownConfigBuilder<'_> {
 // --- Supervision Helper ---
 
 /// Runs a task with restart policy supervision.
-async fn supervise<F, Fut>(name: &str, restart: RestartPolicy, mut factory: F)
+async fn supervise<F, Fut>(name: &'static str, restart: RestartPolicy, mut factory: F)
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = ()> + Send + 'static,
