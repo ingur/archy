@@ -139,12 +139,14 @@ pub enum RestartPolicy {
 }
 
 impl RestartPolicy {
-    /// Helper: Restart up to N times with a 60s stabilization window.
-    /// After running 60s without panic, the counter resets.
+    // Default stabilization window for attempt-based restart policy.
+    pub const DEFAULT_RESET_AFTER: Duration = Duration::from_secs(60);
+
+    /// Helper: Restart up to N times with default stabilization window.
     pub fn attempts(n: usize) -> Self {
         Self::Attempts {
             max: n,
-            reset_after: Some(Duration::from_secs(60)),
+            reset_after: Some(Self::DEFAULT_RESET_AFTER),
         }
     }
 }

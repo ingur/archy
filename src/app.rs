@@ -30,9 +30,17 @@ pub struct SystemConfig {
     pub restart: RestartPolicy,
 }
 
+impl SystemConfig {
+    /// Default number of workers per system.
+    pub const DEFAULT_WORKERS: usize = 1;
+}
+
 impl Default for SystemConfig {
     fn default() -> Self {
-        Self { workers: 1, restart: RestartPolicy::default() }
+        Self {
+            workers: Self::DEFAULT_WORKERS,
+            restart: RestartPolicy::default(),
+        }
     }
 }
 
@@ -76,9 +84,21 @@ pub(crate) struct WorkerConfig {
     pub(crate) restart: RestartPolicy,
 }
 
+impl WorkerConfig {
+    /// Default number of workers per service.
+    pub const DEFAULT_WORKERS: usize = 1;
+    /// Default channel capacity for service message queues.
+    pub const DEFAULT_CAPACITY: usize = 32;
+}
+
 impl Default for WorkerConfig {
     fn default() -> Self {
-        Self { workers: 1, capacity: 64, concurrent: None, restart: RestartPolicy::default() }
+        Self {
+            workers: Self::DEFAULT_WORKERS,
+            capacity: Self::DEFAULT_CAPACITY,
+            concurrent: None,
+            restart: RestartPolicy::default(),
+        }
     }
 }
 
@@ -250,6 +270,9 @@ pub struct App {
 }
 
 impl App {
+    /// Default channel capacity for event buses.
+    pub const DEFAULT_EVENT_CAPACITY: usize = 32;
+
     pub fn new() -> Self {
         Self {
             resources: HashMap::new(),
@@ -264,7 +287,7 @@ impl App {
             closers: Arc::new(Mutex::new(Vec::new())),
             shutdown_token: CancellationToken::new(),
             shutdown_timeout: None,
-            default_capacity: 64,
+            default_capacity: Self::DEFAULT_EVENT_CAPACITY,
         }
     }
 
