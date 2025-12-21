@@ -10,15 +10,18 @@ use parking_lot::Mutex;
 use tokio::sync::{broadcast, Semaphore};
 use tokio_util::sync::CancellationToken;
 
-use crate::{FromApp, Module, RestartPolicy, Schedule, Service};
+use crate::{FromApp, Module, RestartPolicy, Schedule, Service, SystemResult};
 
 // --- System Types ---
 
 pub(crate) type BoxFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 
+/// Future type for systems - returns SystemResult to enable error-based restarts
+pub(crate) type SystemFuture = Pin<Box<dyn Future<Output = SystemResult> + Send>>;
+
 /// A factory that can create system futures. Can be called multiple times (for Fixed schedules).
 /// Uses Arc for zero-overhead sharing: dereference is same cost as Box, clone only on restart.
-pub type SystemFactory = Arc<dyn Fn() -> BoxFuture + Send + Sync>;
+pub type SystemFactory = Arc<dyn Fn() -> SystemFuture + Send + Sync>;
 
 /// Creates system factories from the app context
 pub(crate) type SystemSpawner = Box<dyn FnOnce(&App, usize) -> Vec<SystemFactory> + Send>;
@@ -221,10 +224,10 @@ impl ShutdownConfigBuilder<'_> {
     }
 }
 
-// --- Supervision Helper ---
+// --- Supervision Helpers ---
 
-/// Runs a task with restart policy supervision.
-async fn supervise<F, Fut>(name: &'static str, restart: RestartPolicy, mut factory: F)
+/// Supervise service workers - restarts on panic only
+async fn supervise_service<F, Fut>(name: &'static str, restart: RestartPolicy, mut factory: F)
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = ()> + Send + 'static,
@@ -267,6 +270,82 @@ where
                     }
                     Err(_) => break,
                 }
+            }
+        }
+    }
+}
+
+/// Supervise systems - restarts on panic OR error return
+async fn supervise_system<F, Fut>(name: &'static str, restart: RestartPolicy, mut factory: F)
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = SystemResult> + Send + 'static,
+{
+    match restart {
+        RestartPolicy::Never => {
+            let result = tokio::spawn(factory()).await;
+            match result {
+                Ok(SystemResult::Ok) => {}
+                Ok(SystemResult::Err(e)) => {
+                    tracing::warn!(target: "archy", task = %name, error = %e, "system failed");
+                }
+                Err(e) if e.is_panic() => {
+                    tracing::error!(target: "archy", task = %name, error = ?e, "system panicked");
+                }
+                Err(_) => {}
+            }
+        }
+        RestartPolicy::Always => {
+            loop {
+                let result = tokio::spawn(factory()).await;
+                match result {
+                    Ok(SystemResult::Ok) => break,
+                    Ok(SystemResult::Err(e)) => {
+                        tracing::warn!(target: "archy", task = %name, error = %e, "system failed, restarting");
+                    }
+                    Err(e) if e.is_panic() => {
+                        tracing::warn!(target: "archy", task = %name, error = ?e, "system panicked, restarting");
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+        RestartPolicy::Attempts { max, reset_after } => {
+            let mut attempts = 0;
+            loop {
+                let start = Instant::now();
+                let result = tokio::spawn(factory()).await;
+
+                let should_restart = match result {
+                    Ok(SystemResult::Ok) => false,
+                    Ok(SystemResult::Err(e)) => {
+                        tracing::warn!(target: "archy", task = %name, error = %e, "system failed");
+                        true
+                    }
+                    Err(e) if e.is_panic() => {
+                        tracing::warn!(target: "archy", task = %name, error = ?e, "system panicked");
+                        true
+                    }
+                    Err(_) => false,
+                };
+
+                if !should_restart {
+                    break;
+                }
+
+                if let Some(duration) = reset_after
+                    && start.elapsed() >= duration
+                {
+                    attempts = 0;
+                }
+
+                attempts += 1;
+                if attempts >= max {
+                    tracing::error!(target: "archy", task = %name, max_attempts = max, "max restart attempts reached");
+                    break;
+                }
+
+                tracing::info!(target: "archy", task = %name, attempt = attempts, max_attempts = max, "restarting");
             }
         }
     }
@@ -407,7 +486,7 @@ impl App {
 
                 match config.concurrent {
                     None => Box::pin(async move {
-                        supervise("service worker", restart, || {
+                        supervise_service("service worker", restart, || {
                             let rx = rx.clone();
                             let svc = svc.clone();
                             async move {
@@ -421,7 +500,7 @@ impl App {
                     Some(max_concurrent) => {
                         let semaphore = Arc::new(Semaphore::new(max_concurrent));
                         Box::pin(async move {
-                            supervise("service worker", restart, || {
+                            supervise_service("service worker", restart, || {
                                 let rx = rx.clone();
                                 let svc = svc.clone();
                                 let semaphore = semaphore.clone();
@@ -576,7 +655,10 @@ impl App {
         for desc in run {
             let config = self.resolve_system(&desc.overrides);
             for factory in (desc.spawner)(&self, config.workers) {
-                system_handles.push(tokio::spawn(Self::supervise_system(factory, config.restart)));
+                let restart = config.restart;
+                system_handles.push(tokio::spawn(async move {
+                    supervise_system("system", restart, || factory()).await;
+                }));
             }
         }
 
@@ -593,7 +675,7 @@ impl App {
                 let token = token.clone();
                 let restart = config.restart;
                 system_handles.push(tokio::spawn(async move {
-                    supervise("fixed system", restart, || {
+                    supervise_system("fixed system", restart, || {
                         let factory = factory.clone();
                         let token = token.clone();
                         async move {
@@ -602,9 +684,12 @@ impl App {
                             loop {
                                 tokio::select! {
                                     _ = interval.tick() => {}
-                                    _ = token.cancelled() => break,
+                                    _ = token.cancelled() => return SystemResult::Ok,
                                 }
-                                factory().await;
+                                match factory().await {
+                                    SystemResult::Ok => {}
+                                    err @ SystemResult::Err(_) => return err,
+                                }
                             }
                         }
                     }).await;
@@ -661,14 +746,13 @@ impl App {
         for desc in systems {
             let config = self.resolve_system(&desc.overrides);
             for factory in (desc.spawner)(self, config.workers) {
-                handles.push(tokio::spawn(Self::supervise_system(factory, config.restart)));
+                let restart = config.restart;
+                handles.push(tokio::spawn(async move {
+                    supervise_system("system", restart, || factory()).await;
+                }));
             }
         }
         for h in handles { let _ = h.await; }
-    }
-
-    async fn supervise_system(factory: SystemFactory, restart: RestartPolicy) {
-        supervise("system", restart, || factory()).await;
     }
 }
 

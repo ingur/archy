@@ -6,10 +6,10 @@ use std::future::Future;
 use std::sync::Arc;
 
 use crate::app::{
-    AddEvents, AddResources, AddServices, App, BoxFuture, IntoSystem, IntoSystemConfigs,
-    SystemDescriptor, SystemFactory, SystemSpawner,
+    AddEvents, AddResources, AddServices, App, IntoSystem, IntoSystemConfigs,
+    SystemDescriptor, SystemFactory, SystemFuture, SystemSpawner,
 };
-use crate::{FromApp, Schedule, Service};
+use crate::{FromApp, Schedule, Service, SystemOutput};
 
 // --- FromApp Tuples ---
 
@@ -38,10 +38,11 @@ impl_from_app_tuple!(P1, P2, P3, P4, P5, P6, P7, P8, P9, P10, P11, P12);
 
 macro_rules! impl_into_system {
     () => {
-        impl<Func, Fut> IntoSystem<()> for Func
+        impl<Func, Fut, Out> IntoSystem<()> for Func
         where
             Func: Fn() -> Fut + Send + Sync + Clone + 'static,
-            Fut: Future<Output = ()> + Send + 'static,
+            Fut: Future<Output = Out> + Send + 'static,
+            Out: SystemOutput,
         {
             fn into_system(self) -> SystemSpawner {
                 Box::new(move |_app, workers| {
@@ -49,7 +50,7 @@ macro_rules! impl_into_system {
                         let func = self.clone();
                         Arc::new(move || {
                             let func = func.clone();
-                            Box::pin(async move { func().await }) as BoxFuture
+                            Box::pin(async move { func().await.into_result() }) as SystemFuture
                         }) as SystemFactory
                     }).collect()
                 })
@@ -58,10 +59,11 @@ macro_rules! impl_into_system {
     };
     ($($P:ident),+) => {
         #[allow(non_snake_case)]
-        impl<Func, Fut, $($P),+> IntoSystem<($($P,)+)> for Func
+        impl<Func, Fut, Out, $($P),+> IntoSystem<($($P,)+)> for Func
         where
             Func: Fn($($P),+) -> Fut + Send + Sync + Clone + 'static,
-            Fut: Future<Output = ()> + Send + 'static,
+            Fut: Future<Output = Out> + Send + 'static,
+            Out: SystemOutput,
             $($P: FromApp),+
         {
             fn into_system(self) -> SystemSpawner {
@@ -74,7 +76,7 @@ macro_rules! impl_into_system {
                         Arc::new(move || {
                             let func = func.clone();
                             $(let $P = $P.clone();)+
-                            Box::pin(async move { func($($P),+).await }) as BoxFuture
+                            Box::pin(async move { func($($P),+).await.into_result() }) as SystemFuture
                         }) as SystemFactory
                     }).collect()
                 })

@@ -33,7 +33,7 @@ pub mod prelude {
     pub use crate::{
         App, Res, Client, Emit, Sub, Shutdown,
         Service, ServiceFactory, ClientMethods, ServiceFutureExt, ServiceResultExt, FromApp, Module,
-        Schedule, RestartPolicy, ServiceError,
+        Schedule, RestartPolicy, ServiceError, SystemOutput,
         service,
     };
 }
@@ -147,6 +147,41 @@ impl RestartPolicy {
         Self::Attempts {
             max: n,
             reset_after: Some(Self::DEFAULT_RESET_AFTER),
+        }
+    }
+}
+
+// --- System Result & Output ---
+
+/// Result of system execution
+#[derive(Debug)]
+pub enum SystemResult {
+    /// System completed successfully
+    Ok,
+    /// System failed with an error (triggers restart policy)
+    Err(String),
+}
+
+/// Trait for types that can be returned from system functions.
+///
+/// Implemented for `()` (always succeeds) and `Result<(), E>` (error triggers restart).
+pub trait SystemOutput: Send {
+    fn into_result(self) -> SystemResult;
+}
+
+impl SystemOutput for () {
+    #[inline(always)]
+    fn into_result(self) -> SystemResult {
+        SystemResult::Ok
+    }
+}
+
+impl<E: std::fmt::Display + Send + 'static> SystemOutput for Result<(), E> {
+    #[inline]
+    fn into_result(self) -> SystemResult {
+        match self {
+            Ok(()) => SystemResult::Ok,
+            Err(e) => SystemResult::Err(e.to_string()),
         }
     }
 }
