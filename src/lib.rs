@@ -263,6 +263,18 @@ impl Shutdown {
     /// Trigger application shutdown.
     pub fn trigger(&self) { self.0.cancel(); }
 
+    /// Check if shutdown has been triggered (sync).
+    ///
+    /// Useful for polling shutdown state without awaiting:
+    /// ```ignore
+    /// if shutdown.is_cancelled() {
+    ///     return;
+    /// }
+    /// ```
+    pub fn is_cancelled(&self) -> bool {
+        self.0.is_cancelled()
+    }
+
     /// Returns a future that completes when shutdown is triggered.
     ///
     /// Useful in `select!` patterns:

@@ -85,21 +85,39 @@ pub fn shutdown(_attr: TokenStream, item: TokenStream) -> TokenStream {
 
 /// Derive macro for Service structs - generates ServiceFactory implementation
 ///
+/// Automatically recognizes archy types (`Res`, `Client`, `Emit`, `Sub`, `Shutdown`)
+/// and injects them via `app.extract()`. All other fields use `Default::default()`.
+///
+/// For custom initialization of state fields, use `#[startup]` in your `#[service]` impl.
+///
 /// ```ignore
 /// #[derive(Service)]
-/// struct PaymentService {
-///     config: Res<Config>,
-///     orders: Client<OrderService>,
+/// struct JobService {
+///     config: Res<Config>,              // → app.extract()
+///     metrics: Client<MetricsService>,  // → app.extract()
+///     cache: RwLock<HashMap<K, V>>,     // → Default::default()
+///     counter: AtomicU64,               // → Default::default()
+/// }
+///
+/// #[service]
+/// impl JobService {
+///     #[startup]
+///     async fn init(&self) {
+///         // Custom initialization if Default isn't enough
+///         self.counter.store(1, Ordering::SeqCst);
+///     }
 /// }
 /// ```
 ///
 /// Generates:
 /// ```ignore
-/// impl ::archy::ServiceFactory for PaymentService {
+/// impl ::archy::ServiceFactory for JobService {
 ///     fn create(app: &::archy::App) -> Self {
-///         PaymentService {
+///         JobService {
 ///             config: app.extract(),
-///             orders: app.extract(),
+///             metrics: app.extract(),
+///             cache: Default::default(),
+///             counter: Default::default(),
 ///         }
 ///     }
 /// }
@@ -123,7 +141,13 @@ pub fn derive_service(input: TokenStream) -> TokenStream {
 
     let field_inits = fields.iter().map(|f| {
         let field_name = f.ident.as_ref().unwrap();
-        quote! { #field_name: app.extract() }
+        let field_ty = &f.ty;
+
+        if is_archy_injectable(field_ty) {
+            quote! { #field_name: app.extract() }
+        } else {
+            quote! { #field_name: ::std::default::Default::default() }
+        }
     });
 
     let expanded = quote! {
@@ -137,6 +161,17 @@ pub fn derive_service(input: TokenStream) -> TokenStream {
     };
 
     TokenStream::from(expanded)
+}
+
+/// Check if a type is an archy injectable type (Res, Client, Emit, Sub, Shutdown)
+fn is_archy_injectable(ty: &syn::Type) -> bool {
+    if let syn::Type::Path(type_path) = ty {
+        if let Some(segment) = type_path.path.segments.last() {
+            let ident = segment.ident.to_string();
+            return matches!(ident.as_str(), "Res" | "Client" | "Emit" | "Sub" | "Shutdown");
+        }
+    }
+    false
 }
 
 /// Attribute macro for Service impl blocks - generates message enum, Service impl, and Client methods
@@ -464,11 +499,9 @@ pub fn service(attr: TokenStream, item: TokenStream) -> TokenStream {
             };
 
             quote! {
-                pub async fn #method_name(&self, #(#param_decls),*) -> ::std::result::Result<#return_type, ::archy::ServiceError> {
+                pub async fn #method_name(&self, #(#param_decls),*) {
                     #span_capture
-                    self.sender.send(#msg_construction).await
-                        .map_err(|_| ::archy::ServiceError::ChannelClosed)?;
-                    Ok(())
+                    let _ = self.sender.send(#msg_construction).await;
                 }
             }
         } else {
