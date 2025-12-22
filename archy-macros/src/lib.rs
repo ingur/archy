@@ -38,6 +38,51 @@ pub fn untraced(_attr: TokenStream, item: TokenStream) -> TokenStream {
     item
 }
 
+/// Marker attribute for service startup hook.
+/// Use on a single method within a `#[service]` impl block.
+/// The method runs after service creation, before workers start receiving messages.
+///
+/// **Note:** Cannot call other services - workers aren't running yet.
+///
+/// ```ignore
+/// #[service]
+/// impl CacheService {
+///     #[startup]
+///     async fn load_cache(&self) {
+///         // Runs before any messages are processed
+///         let data = self.db.load_all().await;
+///         *self.cache.write() = data;
+///     }
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn startup(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    // This is just a marker - the actual processing happens in #[service]
+    item
+}
+
+/// Marker attribute for service shutdown hook.
+/// Use on a single method within a `#[service]` impl block.
+/// The method runs on shutdown, before channels close.
+///
+/// **Note:** Can call other services - workers are still running.
+///
+/// ```ignore
+/// #[service]
+/// impl CacheService {
+///     #[shutdown]
+///     async fn flush_cache(&self) {
+///         // Runs on shutdown, can still call other services
+///         self.db.save_all(&self.cache.read()).await;
+///     }
+/// }
+/// ```
+#[proc_macro_attribute]
+pub fn shutdown(_attr: TokenStream, item: TokenStream) -> TokenStream {
+    // This is just a marker - the actual processing happens in #[service]
+    item
+}
+
 /// Derive macro for Service structs - generates ServiceFactory implementation
 ///
 /// ```ignore
@@ -161,12 +206,68 @@ pub fn service(attr: TokenStream, item: TokenStream) -> TokenStream {
     let methods_struct_name = format_ident!("{}Methods", service_name);
 
     // Collect public async methods with their tracing status
+    // Also detect #[startup] and #[shutdown] lifecycle hooks
     let mut methods: Vec<(&ImplItemFn, bool)> = Vec::new();
+    let mut startup_method: Option<&syn::Ident> = None;
+    let mut shutdown_method: Option<&syn::Ident> = None;
+
     for item in &input.items {
         if let ImplItem::Fn(method) = item {
-            let is_pub = matches!(method.vis, syn::Visibility::Public(_));
             let is_async = method.sig.asyncness.is_some();
             let has_self = method.sig.inputs.first().map_or(false, |arg| matches!(arg, FnArg::Receiver(_)));
+
+            // Check for lifecycle attributes
+            let has_startup = has_attribute(&method.attrs, "startup");
+            let has_shutdown = has_attribute(&method.attrs, "shutdown");
+
+            // Validate lifecycle methods
+            if has_startup {
+                if !is_async || !has_self {
+                    return syn::Error::new_spanned(
+                        &method.sig.ident,
+                        "#[startup] method must be async fn(&self)"
+                    ).to_compile_error().into();
+                }
+                if method.sig.inputs.len() > 1 {
+                    return syn::Error::new_spanned(
+                        &method.sig.ident,
+                        "#[startup] method cannot have parameters other than &self"
+                    ).to_compile_error().into();
+                }
+                if startup_method.is_some() {
+                    return syn::Error::new_spanned(
+                        &method.sig.ident,
+                        "only one #[startup] method allowed per service"
+                    ).to_compile_error().into();
+                }
+                startup_method = Some(&method.sig.ident);
+                continue; // Don't add to regular methods
+            }
+
+            if has_shutdown {
+                if !is_async || !has_self {
+                    return syn::Error::new_spanned(
+                        &method.sig.ident,
+                        "#[shutdown] method must be async fn(&self)"
+                    ).to_compile_error().into();
+                }
+                if method.sig.inputs.len() > 1 {
+                    return syn::Error::new_spanned(
+                        &method.sig.ident,
+                        "#[shutdown] method cannot have parameters other than &self"
+                    ).to_compile_error().into();
+                }
+                if shutdown_method.is_some() {
+                    return syn::Error::new_spanned(
+                        &method.sig.ident,
+                        "only one #[shutdown] method allowed per service"
+                    ).to_compile_error().into();
+                }
+                shutdown_method = Some(&method.sig.ident);
+                continue; // Don't add to regular methods
+            }
+
+            let is_pub = matches!(method.vis, syn::Visibility::Public(_));
 
             if is_pub && is_async && has_self {
                 // Check for #[traced] and #[untraced] attributes on the method
@@ -389,6 +490,24 @@ pub fn service(attr: TokenStream, item: TokenStream) -> TokenStream {
         }
     });
 
+    // Generate startup impl if a #[startup] method was found
+    let startup_impl = startup_method.map(|method_name| {
+        quote! {
+            fn startup(self: ::std::sync::Arc<Self>) -> impl ::std::future::Future<Output = ()> + Send {
+                async move { self.#method_name().await }
+            }
+        }
+    });
+
+    // Generate shutdown impl if a #[shutdown] method was found
+    let shutdown_impl = shutdown_method.map(|method_name| {
+        quote! {
+            fn shutdown(self: ::std::sync::Arc<Self>) -> impl ::std::future::Future<Output = ()> + Send {
+                async move { self.#method_name().await }
+            }
+        }
+    });
+
     let expanded = quote! {
         // Original impl block (preserved)
         #input
@@ -425,6 +544,8 @@ pub fn service(attr: TokenStream, item: TokenStream) -> TokenStream {
                 <Self as ::archy::ServiceFactory>::create(app)
             }
 
+            #startup_impl
+
             fn handle(self: ::std::sync::Arc<Self>, msg: Self::Message) -> impl ::std::future::Future<Output = ()> + Send {
                 async move {
                     match msg {
@@ -432,6 +553,8 @@ pub fn service(attr: TokenStream, item: TokenStream) -> TokenStream {
                     }
                 }
             }
+
+            #shutdown_impl
         }
     };
 

@@ -83,7 +83,16 @@ pub(crate) struct EventBus<E> {
 type Closer = Box<dyn FnOnce() + Send>;
 type ChannelCreator = Box<dyn FnOnce(usize) -> (Arc<dyn Any + Send + Sync>, Arc<dyn Any + Send + Sync>) + Send>;
 type EventCreator = Box<dyn FnOnce(usize) -> Arc<dyn Any + Send + Sync> + Send>;
-type ServiceSpawner = Box<dyn FnOnce(&App, Arc<dyn Any + Send + Sync>, WorkerConfig) -> Vec<BoxFuture> + Send>;
+type LifecycleHook = Box<dyn FnOnce() -> BoxFuture + Send>;
+
+/// Result of spawning a service - includes lifecycle hooks and worker futures
+struct ServiceSpawnResult {
+    startup: LifecycleHook,
+    workers: Vec<BoxFuture>,
+    shutdown: LifecycleHook,
+}
+
+type ServiceSpawner = Box<dyn FnOnce(&App, Arc<dyn Any + Send + Sync>, WorkerConfig) -> ServiceSpawnResult + Send>;
 
 #[derive(Clone)]
 pub(crate) struct WorkerConfig {
@@ -372,6 +381,7 @@ pub struct App {
     event_defaults: EventOverrides,
 
     closers: Arc<Mutex<Vec<Closer>>>,
+    shutdown_hooks: Vec<LifecycleHook>,
     pub(crate) shutdown_token: CancellationToken,
     pub(crate) shutdown_timeout: Option<Duration>,
 }
@@ -395,6 +405,7 @@ impl App {
             system_defaults: SystemOverrides::default(),
             event_defaults: EventOverrides::default(),
             closers: Arc::new(Mutex::new(Vec::new())),
+            shutdown_hooks: Vec::new(),
             shutdown_token: CancellationToken::new(),
             shutdown_timeout: None,
         }
@@ -479,7 +490,16 @@ impl App {
             let rx = rx_any.downcast::<Receiver<S::Message>>().unwrap();
             let service = Arc::new(S::create(app));
 
-            (0..config.workers).map(|_| {
+            // Create startup hook
+            let startup_svc = service.clone();
+            let startup: LifecycleHook = Box::new(move || {
+                Box::pin(async move {
+                    startup_svc.startup().await;
+                })
+            });
+
+            // Create worker futures
+            let workers: Vec<BoxFuture> = (0..config.workers).map(|_| {
                 let rx = rx.as_ref().clone();
                 let svc = service.clone();
                 let restart = config.restart;
@@ -519,7 +539,17 @@ impl App {
                         }) as BoxFuture
                     }
                 }
-            }).collect()
+            }).collect();
+
+            // Create shutdown hook
+            let shutdown_svc = service.clone();
+            let shutdown: LifecycleHook = Box::new(move || {
+                Box::pin(async move {
+                    shutdown_svc.shutdown().await;
+                })
+            });
+
+            ServiceSpawnResult { startup, workers, shutdown }
         }));
 
         ServiceConfigBuilder { overrides: self.service_overrides.entry(id).or_default() }
@@ -636,21 +666,40 @@ impl App {
         let first = self.extract_systems(|s| matches!(s, Schedule::First));
         self.run_phase_blocking(first).await;
 
-        // Phase 3: Spawn service workers
+        // Phase 3: Create services and run startup hooks
         let spawners = std::mem::take(&mut self.service_spawners);
+        let mut startup_futures = Vec::new();
+        let mut worker_batches = Vec::new();
+
         for (id, spawner) in spawners {
             let config = self.resolve_service(id);
             let rx = receivers.remove(&id).unwrap();
-            for fut in spawner(&self, rx, config) {
+            let result = spawner(&self, rx, config);
+            startup_futures.push((result.startup)());
+            worker_batches.push(result.workers);
+            self.shutdown_hooks.push(result.shutdown);
+        }
+
+        // Run all service startups in parallel (panic = abort)
+        let startup_handles: Vec<_> = startup_futures.into_iter()
+            .map(|fut| tokio::spawn(fut))
+            .collect();
+        for handle in startup_handles {
+            handle.await.expect("service startup panicked");
+        }
+
+        // Phase 4: Spawn service workers
+        for workers in worker_batches {
+            for fut in workers {
                 service_handles.push(tokio::spawn(fut));
             }
         }
 
-        // Phase 4: Run Startup systems (blocking)
+        // Phase 5: Run Startup systems (blocking)
         let startup = self.extract_systems(|s| matches!(s, Schedule::Startup));
         self.run_phase_blocking(startup).await;
 
-        // Phase 5: Spawn Run systems (background)
+        // Phase 6: Spawn Run systems (background)
         let run = self.extract_systems(|s| matches!(s, Schedule::Run));
         for desc in run {
             let config = self.resolve_system(&desc.overrides);
@@ -662,7 +711,7 @@ impl App {
             }
         }
 
-        // Phase 6: Spawn Fixed systems (interval loops)
+        // Phase 7: Spawn Fixed systems (interval loops)
         let fixed = self.extract_systems(|s| matches!(s, Schedule::Fixed(_)));
         for desc in fixed {
             let duration = match desc.schedule {
@@ -700,11 +749,31 @@ impl App {
         // Wait for shutdown
         self.shutdown_token.cancelled().await;
 
-        // Phase 7: Run Shutdown systems (blocking)
+        // Phase 8: Run Shutdown systems (blocking)
         let shutdown = self.extract_systems(|s| matches!(s, Schedule::Shutdown));
         self.run_phase_blocking(shutdown).await;
 
-        // Phase 8: Close channels, abort systems, wait for services
+        // Phase 9: Run service shutdown hooks (parallel, with timeout)
+        let shutdown_hooks = std::mem::take(&mut self.shutdown_hooks);
+        let shutdown_handles: Vec<_> = shutdown_hooks.into_iter()
+            .map(|hook| tokio::spawn(hook()))
+            .collect();
+
+        let await_shutdowns = async {
+            for handle in shutdown_handles {
+                let _ = handle.await; // Don't panic on shutdown errors
+            }
+        };
+
+        if let Some(timeout) = self.shutdown_timeout {
+            if tokio::time::timeout(timeout, await_shutdowns).await.is_err() {
+                tracing::warn!(target: "archy", "service shutdown hooks timed out");
+            }
+        } else {
+            await_shutdowns.await;
+        }
+
+        // Phase 10: Close channels, abort systems, wait for services
         let closers = std::mem::take(&mut *self.closers.lock());
         for closer in closers { closer(); }
 
@@ -721,7 +790,7 @@ impl App {
             for h in service_handles { let _ = h.await; }
         }
 
-        // Phase 9: Run Last systems (blocking)
+        // Phase 11: Run Last systems (blocking)
         let last = self.extract_systems(|s| matches!(s, Schedule::Last));
         self.run_phase_blocking(last).await;
     }
