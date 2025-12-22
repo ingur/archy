@@ -25,7 +25,8 @@ pub use app::{
 // Re-export for macro-generated code
 pub use tokio;
 pub use async_channel;
-pub use archy_macros::{Service, service};
+pub use tracing;
+pub use archy_macros::{Service, service, traced, untraced};
 
 // --- Prelude ---
 
@@ -34,7 +35,7 @@ pub mod prelude {
         App, Res, Client, Emit, Sub, Shutdown,
         Service, ServiceFactory, ClientMethods, ServiceFutureExt, ServiceResultExt, FromApp, Module,
         Schedule, RestartPolicy, ServiceError, SystemOutput,
-        service,
+        service, traced, untraced,
     };
 }
 
